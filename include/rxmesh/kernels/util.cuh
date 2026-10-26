@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <memory>
 
 #include "rxmesh/util/macros.h"
 #include "rxmesh/util/timer.h"
@@ -15,11 +16,15 @@ static __global__ void warmup_kernel(float* buffer)
     for (int i = 0; i < 8192; ++i) {
         x = fmaf(x, 1.000001f, 0.000001f);
     }
-    buffer[0] = x;
+    atomicExch(buffer, x);
 }
 
 inline void warmup_gpu(float ms, cudaStream_t stream = NULL)
 {
+    if (ms <= 0.0f) {
+        return;
+    }
+
     int device;
     CUDA_ERROR(cudaGetDevice(&device));
 
@@ -29,17 +34,24 @@ inline void warmup_gpu(float ms, cudaStream_t stream = NULL)
     constexpr int threads = 256;
     const int     blocks  = 32 * prop.multiProcessorCount;
 
-    float* buffer = nullptr;
-    CUDA_ERROR(cudaMalloc(&buffer, sizeof(float)));
+    // allocate one float variable which all threads will write to
+    // this variable will be released at normal program exit so that we leave
+    // the device idle after warmup when cudaFree is called
+    static const std::unique_ptr<float, decltype(&cudaFree)> buffer(
+        [] {
+            float* ptr = nullptr;
+            CUDA_ERROR(cudaMalloc(&ptr, sizeof(float)));
+            return ptr;
+        }(),
+        &cudaFree);
 
     GPUTimer timer(stream);
     timer.start();
     do {
-        warmup_kernel<<<blocks, threads, 0, stream>>>(buffer);
+        warmup_kernel<<<blocks, threads, 0, stream>>>(buffer.get());
+        CUDA_ERROR(cudaGetLastError());
         timer.stop();
     } while (timer.elapsed_millis() < ms);
-
-    GPU_FREE(buffer);
 }
 template <typename attrT>
 __global__ void memcopy(attrT*         d_dest,
