@@ -1,5 +1,7 @@
 #pragma once
+#include <cmath>
 #include <vector>
+#include "rxmesh/kernels/util.cuh"
 #include "rxmesh/util/log.h"
 #include "rxmesh/util/report.h"
 
@@ -63,17 +65,21 @@ vertex_normal_hardwired_kernel(const uint32_t  num_faces,
         T l1 = l2_norm_sq(v1x, v1y, v1z, v2x, v2y, v2z);  // v1-v2
         T l2 = l2_norm_sq(v2x, v2y, v2z, v0x, v0y, v0z);  // v2-v0
 
-        atomicAdd(&d_vertex_normal[v0 * 3 + 0], nx / (l0 + l2));
-        atomicAdd(&d_vertex_normal[v0 * 3 + 1], ny / (l0 + l2));
-        atomicAdd(&d_vertex_normal[v0 * 3 + 2], nz / (l0 + l2));
+        // Match RXMesh: one reciprocal per vertex and SoA normal storage.
+        const T r0 = T(1) / (l0 + l2);
+        const T r1 = T(1) / (l1 + l0);
+        const T r2 = T(1) / (l2 + l1);
+        atomicAdd(&d_vertex_normal[v0], nx * r0);
+        atomicAdd(&d_vertex_normal[v0 + num_vertices], ny * r0);
+        atomicAdd(&d_vertex_normal[v0 + 2 * num_vertices], nz * r0);
 
-        atomicAdd(&d_vertex_normal[v1 * 3 + 0], nx / (l1 + l0));
-        atomicAdd(&d_vertex_normal[v1 * 3 + 1], ny / (l1 + l0));
-        atomicAdd(&d_vertex_normal[v1 * 3 + 2], nz / (l1 + l0));
+        atomicAdd(&d_vertex_normal[v1], nx * r1);
+        atomicAdd(&d_vertex_normal[v1 + num_vertices], ny * r1);
+        atomicAdd(&d_vertex_normal[v1 + 2 * num_vertices], nz * r1);
 
-        atomicAdd(&d_vertex_normal[v2 * 3 + 0], nx / (l2 + l1));
-        atomicAdd(&d_vertex_normal[v2 * 3 + 1], ny / (l2 + l1));
-        atomicAdd(&d_vertex_normal[v2 * 3 + 2], nz / (l2 + l1));
+        atomicAdd(&d_vertex_normal[v2], nx * r2);
+        atomicAdd(&d_vertex_normal[v2 + num_vertices], ny * r2);
+        atomicAdd(&d_vertex_normal[v2 + 2 * num_vertices], nz * r2);
     }
 }
 
@@ -126,24 +132,32 @@ inline void vertex_normal_hardwired(
 
     const uint32_t threads = 256;
     const uint32_t blocks  = DIVIDE_UP(num_faces, threads);
+    report.add_member("blockThreads", threads);
 
-    TestData td;
-    td.test_name  = "VertexNormal";
-    float vn_time = 0;
-    for (uint32_t itr = 0; itr < Arg.num_run; ++itr) {
-        CUDA_ERROR(cudaMemset(d_normals, 0, 3 * num_vertices * sizeof(T)));
-
-        GPUTimer timer;
-        timer.start();
-
+    auto launch = [&]() {
         vertex_normal_hardwired_kernel<<<blocks, threads>>>(
             num_faces, num_vertices, d_face, d_verts, d_normals);
-
-        timer.stop();
-        CUDA_ERROR(cudaDeviceSynchronize());
         CUDA_ERROR(cudaGetLastError());
-        td.time_ms.push_back(timer.elapsed_millis());
-        vn_time += timer.elapsed_millis();
+    };
+
+    GPUTimer timer;
+    warmup_gpu(1000.0f);
+
+    TestData td;
+    td.test_name   = "VertexNormal";
+    td.num_threads = threads;
+    td.num_blocks  = blocks;
+    float vn_time  = 0;
+    for (uint32_t itr = 0; itr < Arg.num_run; ++itr) {
+        // Time only the kernel; finish the reset before recording the start.
+        CUDA_ERROR(cudaMemsetAsync(d_normals, 0, 3 * num_vertices * sizeof(T)));
+        CUDA_ERROR(cudaStreamSynchronize(nullptr));
+        timer.start();
+        launch();
+        timer.stop();
+        const float elapsed = timer.elapsed_millis();
+        td.time_ms.push_back(elapsed);
+        vn_time += elapsed;
     }
 
     vn_time /= Arg.num_run;
@@ -163,10 +177,20 @@ inline void vertex_normal_hardwired(
     RXMESH_INFO("vertex_normal_hardwired() vertex normal kernel took {} (ms)",
                 vn_time);
 
-    bool passed = compare(vertex_normal_gold.data(),
-                          verts_normal_hardwired,
-                          Verts.size() * 3,
-                          false);
+    bool         passed = true;
+    const double atol   = sizeof(T) == 8 ? 1e-9 : 1e-4;
+    const double rtol   = sizeof(T) == 8 ? 1e-8 : 1e-3;
+    for (uint32_t v = 0; v < num_vertices; ++v) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            const double ref = double(vertex_normal_gold[3 * v + c]);
+            const double val =
+                double(verts_normal_hardwired[v + c * num_vertices]);
+            if (!std::isfinite(ref) || !std::isfinite(val) ||
+                std::abs(ref - val) > atol + rtol * std::abs(ref)) {
+                passed = false;
+            }
+        }
+    }
     td.passed.push_back(passed);
     if (!passed) {
         RXMESH_ERROR("VertexNormal hardwired validation failed");

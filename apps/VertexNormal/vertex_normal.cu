@@ -2,11 +2,12 @@
 // Max, Nelson. "Weights for computing vertex normals from facet normals."
 // Journal of Graphics Tools 4, no. 2 (1999): 1-6.
 
-#include <cuda_profiler_api.h>
 #include <CLI/CLI.hpp>
+#include <cmath>
 #include <cstdlib>
 
 #include "rxmesh/attribute.h"
+#include "rxmesh/kernels/util.cuh"
 #include "rxmesh/rxmesh_static.h"
 #include "rxmesh/util/import_obj.h"
 #include "rxmesh/util/report.h"
@@ -18,7 +19,7 @@ struct arg
 {
     std::string obj_file_name = STRINGIFY(INPUT_DIR) "sphere3.obj";
     std::string output_folder = STRINGIFY(OUTPUT_DIR);
-    uint32_t    num_run       = 1;
+    uint32_t    num_run       = 100;
     uint32_t    device_id     = 0;
     char**      argv;
     int         argc;
@@ -43,12 +44,9 @@ void vertex_normal_rxmesh(rxmesh::RXMeshStatic&              rx,
     report.add_member("method", std::string("RXMesh"));
     report.add_member("blockThreads", blockThreads);
 
-    auto coords = rx.add_vertex_attribute<T>(Verts, "coordinates");
-
-
-    // normals
+    auto coords = rx.add_vertex_attribute<T>(Verts, "coordinates", SoA);
     auto v_normals =
-        rx.add_vertex_attribute<T>("v_normals", 3, rxmesh::LOCATION_ALL);
+        rx.add_vertex_attribute<T>("v_normals", 3, LOCATION_ALL, SoA);
 
     // launch box
     LaunchBox<blockThreads> launch_box;
@@ -65,43 +63,57 @@ void vertex_normal_rxmesh(rxmesh::RXMeshStatic&              rx,
     td.static_smem = launch_box.smem_bytes_static;
     td.num_reg     = launch_box.num_registers_per_thread;
 
-    float vn_time = 0;
-    for (uint32_t itr = 0; itr < Arg.num_run; ++itr) {
-        v_normals->reset(0, rxmesh::DEVICE);
-        GPUTimer timer;
-        timer.start();
-
+    auto launch = [&]() {
         compute_vertex_normal<T, blockThreads><<<launch_box.blocks,
                                                  launch_box.num_threads,
                                                  launch_box.smem_bytes_dyn>>>(
             rx.get_context(), *coords, *v_normals);
-
-        timer.stop();
-        CUDA_ERROR(cudaDeviceSynchronize());
         CUDA_ERROR(cudaGetLastError());
-        CUDA_ERROR(cudaProfilerStop());
-        td.time_ms.push_back(timer.elapsed_millis());
-        vn_time += timer.elapsed_millis();
+    };
+
+    GPUTimer timer;
+    warmup_gpu(1000.0f);
+
+    float vn_time = 0;
+    for (uint32_t itr = 0; itr < Arg.num_run; ++itr) {
+        // Time only the kernel; finish the reset before recording the start.
+        v_normals->reset(T(0), DEVICE);
+        CUDA_ERROR(cudaStreamSynchronize(nullptr));
+        timer.start();
+        launch();
+        timer.stop();
+        const float elapsed = timer.elapsed_millis();
+        td.time_ms.push_back(elapsed);
+        vn_time += elapsed;
     }
 
     RXMESH_INFO("vertex_normal_rxmesh() vertex normal kernel took {} (ms)",
                 vn_time / Arg.num_run);
 
-    // Verify
-    v_normals->move(rxmesh::DEVICE, rxmesh::HOST);
 
-    bool passed = true;
-    rx.for_each_vertex(HOST, [&](const VertexHandle& vh) {
-        uint32_t v_id = rx.map_to_global(vh);
+    v_normals->move(DEVICE, HOST);
+    CUDA_ERROR(cudaStreamSynchronize(nullptr));
 
-        for (uint32_t i = 0; i < 3; ++i) {
-            float ref = std::abs(vertex_normal_gold[v_id * 3 + i]);
-            float val = std::abs((*v_normals)(vh, i));
-            if (std::abs(ref - val) > 0.0001f) {
-                passed = false;
+    bool         passed = true;
+    const double atol   = sizeof(T) == 8 ? 1e-9 : 1e-4;
+    const double rtol   = sizeof(T) == 8 ? 1e-8 : 1e-3;
+    rx.for_each_vertex(
+        HOST,
+        [&](const VertexHandle& vh) {
+            uint32_t v_id = rx.map_to_global(vh);
+
+            for (uint32_t i = 0; i < 3; ++i) {
+                const double ref = double(vertex_normal_gold[v_id * 3 + i]);
+                const double val = double((*v_normals)(vh, i));
+                if (!std::isfinite(ref) || !std::isfinite(val) ||
+                    std::abs(ref - val) > atol + rtol * std::abs(ref)) {
+                    passed = false;
+                }
             }
-        }
-    });
+        },
+        nullptr,
+        false);
+    td.passed.push_back(passed);
 
     if (!passed) {
         RXMESH_ERROR("VertexNormal RXMesh validation failed");
@@ -140,10 +152,8 @@ int vertex_normal_main()
     std::vector<rx_coord_t> vertex_normal_gold(3 * Verts.size());
     vertex_normal_ref(Faces, Verts, vertex_normal_gold);
 
-    // RXMesh Impl
     vertex_normal_rxmesh(rx, Verts, vertex_normal_gold);
 
-    // Hardwired Impl
     vertex_normal_hardwired(Faces, Verts, vertex_normal_gold);
 
 #ifdef USE_POLYSCOPE
@@ -168,7 +178,8 @@ int main(int argc, char** argv)
     app.add_option("--num_run",
                    Arg.num_run,
                    "Number of iterations for performance testing")
-        ->default_val(1u);
+        ->default_val(100u)
+        ->check(CLI::PositiveNumber);
 
     app.add_option("-d,--device_id", Arg.device_id, "GPU device ID")
         ->default_val(0u);
